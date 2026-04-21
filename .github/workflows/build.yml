@@ -1,15 +1,15 @@
-name: Build upstream releases
+name: Build upstream main
 
 on:
   schedule:
     - cron: "45 0 * * *"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Upstream tag to (re)build (e.g. v1.2.3). Leave empty to scan for
-          new tags."
+      force:
+        description: "Rebuild even if the current main SHA was already built."
         required: false
-        type: string
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -24,76 +24,54 @@ env:
   IMAGE_NAME: scrt-link
 
 jobs:
-  discover:
+  check:
     runs-on: ubuntu-latest
     outputs:
-      tags: ${{ steps.find.outputs.tags }}
-      latest: ${{ steps.find.outputs.latest }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      build: ${{ steps.resolve.outputs.build }}
     steps:
-      - name: Find new upstream tags
-        id: find
+      - name: Resolve upstream main
+        id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
-          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
-          upstream=$(gh api "repos/${UPSTREAM}/tags" --paginate --jq '.[].name' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          sha=$(gh api "repos/${UPSTREAM}/commits/main" --jq '.sha')
+          short=${sha:0:7}
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "Upstream main: $sha (short: $short)"
 
-          if [[ -z "$upstream" ]]; then
-            echo "No upstream semver tags found."
-            echo 'tags=[]' >> "$GITHUB_OUTPUT"
-            echo 'latest=' >> "$GITHUB_OUTPUT"
+          if [[ "$FORCE" == "true" ]]; then
+            echo "Force rebuild requested."
+            echo "build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          latest=$(printf '%s\n' "$upstream" | sort -V | tail -n1)
-          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
-          echo "Upstream latest: ${latest}"
+          existing=$(gh api "users/${OWNER}/packages/container/${IMAGE_NAME}/versions" \
+            --paginate --jq '[.[].metadata.container.tags[]] | unique | .[]' 2>/dev/null || true)
 
-          if [[ -n "$INPUT_TAG" ]]; then
-            jq -cn --arg t "$INPUT_TAG" '[$t]' > /tmp/tags.json
+          if printf '%s\n' "$existing" | grep -qxF "sha-$short"; then
+            echo "sha-$short already built — skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
           else
-            existing=$(gh api "users/${OWNER}/packages/container/${IMAGE_NAME}/versions" \
-              --paginate --jq '[.[].metadata.container.tags[]] | unique | .[]' 2>/dev/null || true)
-
-            echo "Existing GHCR tags:"
-            printf '%s\n' "$existing" | sed 's/^/  /'
-
-            if [[ -z "$existing" ]]; then
-              printf '%s\n' "$upstream" | sort -V | jq -R . | jq -sc . > /tmp/tags.json
-            else
-              missing=$(printf '%s\n' "$upstream" | sort -u \
-                | grep -vxF -f <(printf '%s\n' "$existing") || true)
-              if [[ -z "$missing" ]]; then
-                echo "Nothing to build."
-                echo 'tags=[]' >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              printf '%s\n' "$missing" | sort -V | jq -R . | jq -sc . > /tmp/tags.json
-            fi
+            echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Will build: $(cat /tmp/tags.json)"
-          echo "tags=$(cat /tmp/tags.json)" >> "$GITHUB_OUTPUT"
-
   build:
-    needs: discover
-    if: needs.discover.outputs.tags != '[]' && needs.discover.outputs.tags != ''
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        tag: ${{ fromJson(needs.discover.outputs.tags) }}
     steps:
-      - name: Checkout upstream at ${{ matrix.tag }}
+      - name: Checkout upstream at ${{ needs.check.outputs.sha }}
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM }}
-          ref: ${{ matrix.tag }}
+          ref: ${{ needs.check.outputs.sha }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -111,10 +89,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},value=${{ matrix.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ matrix.tag }}
-            type=semver,pattern={{major}},value=${{ matrix.tag }}
-            type=raw,value=latest,enable=${{ matrix.tag == needs.discover.outputs.latest }}
+            type=raw,value=latest
+            type=raw,value=sha-${{ needs.check.outputs.short }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
