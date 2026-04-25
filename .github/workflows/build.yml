@@ -67,11 +67,24 @@ jobs:
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout overlay (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
       - name: Checkout upstream at ${{ needs.check.outputs.sha }}
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ needs.check.outputs.sha }}
+          path: upstream
+
+      - name: Apply overlay (Dockerfile + entrypoint)
+        run: |
+          set -euo pipefail
+          cp overlay/Dockerfile upstream/Dockerfile
+          cp overlay/docker-entrypoint.sh upstream/docker-entrypoint.sh
+          chmod +x upstream/docker-entrypoint.sh
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -95,7 +108,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: upstream
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
